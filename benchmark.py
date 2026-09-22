@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import socket
 import statistics
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from acceptance import LogReader, parse_log_counters
 from generate_prompts import ROOT, SIZES, generate
 
 
@@ -35,6 +38,18 @@ def endpoint_url(value: str) -> tuple[str, str]:
     if not fqdn or not re.fullmatch(r"[a-z0-9._-]+", fqdn):
         raise ValueError("The endpoint host cannot be used as an output folder name.")
     return value.rstrip("/"), fqdn
+
+
+def local_log_source(endpoint: str) -> str | None:
+    """Use an existing local Ollama log when the API host is this machine."""
+    host = urlsplit(endpoint).hostname
+    if host not in ("localhost", "127.0.0.1", "::1", socket.gethostname().lower()):
+        return None
+    candidates = [Path.home() / ".ollama" / "logs" / "server.log"]
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.append(Path(os.environ["LOCALAPPDATA"]) / "Ollama" / "server.log")
+    candidates.append(Path("/var/log/ollama.log"))
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def request_json(url: str, payload: dict | None = None, timeout: int = 30) -> dict:
@@ -90,24 +105,50 @@ def rate(count: object, duration_ns: object) -> float | None:
     return c * 1e9 / d if c is not None and d is not None and d > 0 else None
 
 
-def mtp_metrics(final: dict, model_info: dict, model: str) -> tuple[str, float | None]:
+def draft_counters(final: dict) -> tuple[int, int] | None:
+    """Accept both native top-level counters and llama.cpp's timings shape."""
+    for fields in (final.get("timings"), final):
+        if not isinstance(fields, dict):
+            continue
+        drafted, accepted = number(fields.get("draft_n")), number(fields.get("draft_n_accepted"))
+        if drafted is not None and accepted is not None and drafted > 0 and 0 <= accepted <= drafted:
+            return int(drafted), int(accepted)
+    return None
+
+
+def mtp_metrics(final: dict, model_info: dict, model: str, log_counts: tuple[int, int] | None = None) -> tuple[str, float | None]:
     """Only mark MTP known when model configuration and response support it."""
     params = str(model_info.get("parameters", ""))
     match = re.search(r"(?m)^\s*draft_num_predict\s+(\d+)\s*$", params)
     model_text = model.lower() + " " + json.dumps(model_info.get("details", {})).lower() + " " + str(model_info.get("modelfile", "")).lower()
-    hints_mtp = "mtp" in model_text
+    gguf_info = model_info.get("model_info", {})
+    head_in_metadata = isinstance(gguf_info, dict) and any(
+        key.endswith(".nextn_predict_layers") and number(value) is not None and number(value) > 0
+        for key, value in gguf_info.items()
+    )
+    head_in_tensors = any(
+        ".nextn." in tensor.get("name", "").lower() or ".mtp." in tensor.get("name", "").lower()
+        for tensor in model_info.get("tensors", []) if isinstance(tensor, dict)
+    )
+    hints_mtp = head_in_metadata or head_in_tensors or "mtp" in model_text
     state = "on" if match and int(match.group(1)) > 0 and hints_mtp else "off" if match and int(match.group(1)) == 0 else "unknown"
-    drafted = number(final.get("draft_n"))
-    accepted = number(final.get("draft_n_accepted"))
-    acceptance = accepted / drafted if drafted and accepted is not None and 0 <= accepted <= drafted and hints_mtp else None
+    counters = draft_counters(final) or log_counts
+    acceptance = counters[1] / counters[0] if counters and hints_mtp else None
     if acceptance is not None:
         state = "on"
     return state, acceptance
 
 
-def run_one(endpoint: str, model: str, prompt: str, model_info: dict) -> tuple[str, dict]:
+def run_one(endpoint: str, model: str, prompt: str, model_info: dict, log_reader: LogReader | None = None) -> tuple[str, dict]:
     payload = {"model": model, "prompt": prompt, "stream": True}
     request = Request(endpoint + "/api/generate", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    log_mark = None
+    log_error = None
+    if log_reader is not None and ("mtp" in model.lower() or mtp_metrics({}, model_info, model)[0] == "on"):
+        try:
+            log_mark = log_reader.mark()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            log_error = f"Cannot mark server log: {exc}"
     started_at = now()
     start = time.perf_counter()
     fragments: list[str] = []
@@ -131,7 +172,21 @@ def run_one(endpoint: str, model: str, prompt: str, model_info: dict) -> tuple[s
     wall_s = time.perf_counter() - start
     if final is None:
         raise RuntimeError("Ollama stream ended without a final metrics event")
-    mtp, acceptance = mtp_metrics(final, model_info, model)
+    api_counts = draft_counters(final)
+    log_counts = None
+    if log_mark is not None and api_counts is None:
+        for attempt in range(5):
+            try:
+                log_counts = parse_log_counters(log_reader.read_since(log_mark))
+                if log_counts is not None:
+                    break
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                log_error = f"Cannot read server log: {exc}"
+                break
+            if attempt < 4:
+                time.sleep(0.25)
+    counters = api_counts or log_counts
+    mtp, acceptance = mtp_metrics(final, model_info, model, log_counts)
     metrics = {
         "started_at": started_at,
         "finished_at": now(),
@@ -141,6 +196,10 @@ def run_one(endpoint: str, model: str, prompt: str, model_info: dict) -> tuple[s
         "eval_tps": rate(final.get("eval_count"), final.get("eval_duration")),
         "mtp": mtp,
         "mtp_acceptance_rate": acceptance,
+        "drafted_tokens": counters[0] if counters else None,
+        "accepted_draft_tokens": counters[1] if counters else None,
+        "acceptance_source": "api" if api_counts else log_reader.source if log_counts else None,
+        "acceptance_error": log_error,
     }
     return "".join(fragments), {"request": payload, "ollama_final": final, "metrics": metrics}
 
@@ -165,8 +224,10 @@ def report(run: dict, samples: list[dict]) -> str:
         "TTFT is local time from request start to the first nonempty streamed response. It includes model loading and prompt processing. "
         "Prefill and evaluation rates use Ollama token counts and durations (nanoseconds). "
         "Prefill may include cached tokens in its count; see raw metadata. "
-        "MTP is `unknown` unless the model configuration or response identifies it. "
-        "Acceptance is shown only when the API returns draft and accepted counts.",
+        "MTP `on` means the model configuration enables drafting and indicates an MTP head; it does not prove that a particular request drafted tokens. "
+        "Acceptance uses draft counts from the API when available, or the configured Ollama server log. "
+        "A missing rate means no unambiguous counters were available for that sample. "
+        "The per-sample JSON records the counter source and any log error.",
         "",
     ]
     for model in run["models"]:
@@ -209,7 +270,7 @@ def main() -> None:
         print(f"Missing prompts: {', '.join(f'{size}.txt' for size in missing)}. Generating them now.")
         generate()
     selected_models = choose(models, "models")
-    prompts = sorted((p for p in (ROOT / "prompt").glob("*.txt") if p.is_file()), key=lambda p: (not p.stem.isdigit(), int(p.stem) if p.stem.isdigit() else p.name))
+    prompts = sorted((p for p in (ROOT / "prompt").glob("*.txt") if p.is_file() and p.name != "0.txt"), key=lambda p: (not p.stem.isdigit(), int(p.stem) if p.stem.isdigit() else p.name))
     selected_prompts = choose([p.name for p in prompts], "prompts")
     rounds = rounds_input()
     start = datetime.now().astimezone()
@@ -226,12 +287,14 @@ def main() -> None:
     model_info = {}
     for model in selected_models:
         try:
-            model_info[model] = request_json(endpoint + "/api/show", {"model": model})
+            model_info[model] = request_json(endpoint + "/api/show", {"model": model, "verbose": True})
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             model_info[model] = {"show_error": str(exc)}
+    source = os.environ.get("OLLAMA_SERVER_LOG", "").strip() or local_log_source(endpoint)
+    log_reader = LogReader(source) if source else None
     run = {"fqdn": fqdn, "endpoint": endpoint, "started_at": now(), "models": selected_models,
            "prompts": selected_prompts, "prompt_snapshots": prompt_snapshots,
-           "rounds": rounds, "model_list": tags, "model_info": model_info}
+           "rounds": rounds, "server_log_source": source or None, "model_list": tags, "model_info": model_info}
     samples: list[dict] = []
     total = len(selected_models) * len(selected_prompts) * rounds
     for model in selected_models:
@@ -242,10 +305,12 @@ def main() -> None:
                 print(f"[{len(samples) + 1}/{total}] {model} / {prompt_name} / round {round_index}", flush=True)
                 item = {"model": model, "prompt": prompt_name, "round": round_index, "response_file": stem + ".txt"}
                 try:
-                    response, metadata = run_one(endpoint, model, prompt_text, model_info[model])
+                    response, metadata = run_one(endpoint, model, prompt_text, model_info[model], log_reader)
                     (output / item["response_file"]).write_text(response, encoding="utf-8")
                     item.update(metadata)
                     item["metrics"] = metadata["metrics"]
+                    if metadata["metrics"]["acceptance_error"]:
+                        print(f"  Acceptance unavailable: {metadata['metrics']['acceptance_error']}")
                 except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
                     item["error"] = str(exc)
                     print(f"  Failed: {exc}")

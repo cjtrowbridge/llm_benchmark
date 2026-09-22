@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-SIZES = (0, 100, 1000, 10000)
+SIZES = (100, 1000, 10000)
 INTRO = "Read the story. Summarize it and answer the final question.\n\n"
 QUESTION = "\n\nQuestion: What color was the brass key?"
 STORY = (
@@ -21,8 +21,6 @@ STORY = (
 
 
 def make_prompt(size: int) -> str:
-    if size == 0:
-        return ""  # An empty baseline cannot contain a story or question.
     if size not in SIZES:
         raise ValueError(f"unsupported prompt size: {size}")
     color = random.choice(("blue", "pink", "gold"))

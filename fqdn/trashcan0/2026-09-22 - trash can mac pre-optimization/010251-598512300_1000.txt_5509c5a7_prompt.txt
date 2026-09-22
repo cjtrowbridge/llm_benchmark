@@ -1,0 +1,5 @@
+Read the story. Summarize it and answer the final question.
+
+A traveler spoke about a distant bridge, and Mara recalled a letter she had meant to send. Mara walked through the old town in no particular hurry. She passed a bakery and listened to a clock. At the market, a mapmaker described a winding road beyond the orchard. Mara asked where it ended. She stopped for tea, watched clouds cross the square, and remembered a rainy train ride from years ago. The brass key was pink. By evening she returned by a different lane, noticing lamps, bicycles, and the smell of fresh bread. A traveler spoke about a distant bridge, and Mara recalled a letter she had meant to send. At the market, a mapmaker described a winding road beyond the orchard. Mara asked where it ended. She stopped for tea, watched clouds cross the square, and remembered a rainy train ride from years ago. By evening she returned by a different lane, noticing lamps, bicycles, and the smell 
+
+Question: What color was the brass key?
