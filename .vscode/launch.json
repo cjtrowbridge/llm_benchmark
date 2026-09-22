@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Benchmark Ollama",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/benchmark.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Generate prompts",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/generate_prompts.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
